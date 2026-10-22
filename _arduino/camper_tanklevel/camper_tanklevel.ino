@@ -6,6 +6,7 @@
  *   - Grey water (optional): second Votronic tank sender on GREY_ADC_PIN (ESP32-C3: GPIO1)
  *   - Gas: BLE gas level sensor, received passively via the built-in Bluetooth LE
  *          (default: Rotarex DIMES / SRG WAVE, see GAS SENSOR DEFINITION in config.h)
+ *   - Water pump (optional): CaraWater pump (e.g. ISP 15), BLE connection (status + control)
  *
  * Values are published via MQTT (Home Assistant discovery) and shown in the web UI.
  */
@@ -18,6 +19,7 @@
 #include "wifi_manager.h"
 #include "water_sensor.h"
 #include "gas_sensor.h"
+#include "pump_ble.h"
 #include "mqtt_ha.h"
 #include "webserver.h"
 
@@ -61,6 +63,12 @@ static void printRead() {
     }
     Serial.printf("[READ] Gas:   %.1f%% (raw %.1f%%) | %.1f L | Battery: %.0f%% | BLE: %s\n",
         g.level, g.raw_level, g.content, g.battery, g.ble_state);
+    if (config.pump_enabled) {
+        const PumpData& p = sensorData.pump;
+        Serial.printf("[READ] Pump:  %s | %s | %.2f bar | %.1f l/min | %.1f V %.1f A | %.1f C | level %u | today %u L\n",
+            p.state, p.running ? "running" : "idle", p.pressure, p.flow, p.voltage, p.current,
+            p.temperature, p.pressure_level, p.daily_liters);
+    }
 }
 
 void setup() {
@@ -79,9 +87,9 @@ void setup() {
     // Phase 1: load config & mount LittleFS
     webserverInit();
 
-    Serial.printf("[MAIN] Fresh water: %s | Grey water: %s | Gas: %s\n",
+    Serial.printf("[MAIN] Fresh water: %s | Grey water: %s | Gas: %s | Pump: %s\n",
         config.water_enabled ? "on" : "off", config.grey_enabled ? "on" : "off",
-        config.gas_enabled ? "on" : "off");
+        config.gas_enabled ? "on" : "off", config.pump_enabled ? "on" : "off");
 
     // Phase 2: water tank ADCs
     if (config.water_enabled || config.grey_enabled) waterInit();
@@ -89,13 +97,15 @@ void setup() {
     // Phase 3: WiFi (blocking connect or AP fallback)
     wifiManagerInit();
 
-    // Phase 4: Bluetooth LE scanner (after WiFi, both share the radio)
-    if (config.gas_enabled) {
+    // Phase 4: Bluetooth LE (after WiFi, both share the radio).
+    // The scanner also runs for the pump alone (device list for picking its MAC).
+    if (config.gas_enabled || config.pump_enabled) {
         gasInit();
     } else {
         sensorData.gas.battery = NAN;
         strlcpy(sensorData.gas.ble_state, "Deaktiviert", sizeof(sensorData.gas.ble_state));
     }
+    if (config.pump_enabled) pumpInit();
 
     // Phase 5: start web server
     webserverStart();
@@ -112,7 +122,8 @@ void loop() {
     ArduinoOTA.handle();
 
     if (config.water_enabled || config.grey_enabled) waterLoop();
-    if (config.gas_enabled) gasLoop();
+    if (config.gas_enabled || config.pump_enabled) gasLoop();
+    if (config.pump_enabled) pumpLoop();
     mqttLoop();
     webserverLoop();
 
@@ -122,8 +133,8 @@ void loop() {
         if (cmd == "read") {
             printRead();
         } else if (cmd == "scan") {
-            if (config.gas_enabled) gasPrintSeenList();
-            else Serial.println("[CMD] Gas sensor is disabled");
+            if (config.gas_enabled || config.pump_enabled) gasPrintSeenList();
+            else Serial.println("[CMD] Bluetooth is disabled");
         } else if (cmd == "filter") {
             config.fresh.filter_active = !config.fresh.filter_active;
             saveConfig();

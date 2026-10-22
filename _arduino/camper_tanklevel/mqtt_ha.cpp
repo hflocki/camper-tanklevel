@@ -1,6 +1,7 @@
 #include "mqtt_ha.h"
 #include "wifi_manager.h"
 #include "webserver.h"
+#include "pump_ble.h"
 
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -14,16 +15,25 @@
 //   <prefix>/gas/<value>            gas values
 //   <prefix>/cmd/water/filter/set   ON / OFF / TOGGLE (fresh water filter)
 //   <prefix>/cmd/grey/filter/set    ON / OFF / TOGGLE (grey water filter)
+//   <prefix>/pump/<value>           water pump values (optional)
+//   <prefix>/cmd/pump/enable/set           ON / OFF   (pump enable)
+//   <prefix>/cmd/pump/leak/set             ON / OFF   (leak detection)
+//   <prefix>/cmd/pump/pressure_level/set   1 / 2 / 3  (or "Stufe 1" ...)
+//   <prefix>/cmd/pump/release/set          ON / OFF   (release Bluetooth for the app)
 //
-// Home Assistant: one device "Camper Tanklevel" with all entities.
+// Home Assistant: one device "Camper Tanklevel" with the tank entities,
+// plus a device "CaraWater Pumpe" (via_device) for the optional pump.
 
 #define HA_NODE_ID  "camper_tanklevel"
+#define HA_PUMP_ID  "camper_tanklevel_pump"
 
 static WiFiClient espClient;
 static PubSubClient mqtt(espClient);
 
 static unsigned long lastWaterPublish = 0;
 static unsigned long lastGasPublish = 0;
+static unsigned long lastPumpPublish = 0;
+static uint32_t lastPublishedPumpUpdate = 0;
 static unsigned long lastReconnect = 0;
 static bool discoveryPublished = false;
 static uint32_t lastPublishedGasUpdate = 0;
@@ -31,6 +41,9 @@ static uint32_t lastPublishedGasUpdate = 0;
 static void mqttCallback(char* topic, byte* payload, unsigned int length);
 static void publishTankState(const char* sub, const WaterData& w, const TankConfig& t);
 static void publishGasState();
+static void publishPumpState();
+static void publishPumpDiscovery();
+static void removePumpDiscovery();
 static void publishSensor(const char* name, const char* id, const char* topic, const char* unit,
                           const char* devClass, const char* icon, bool measurement, bool keepLastValue);
 static void publishSwitch(const char* name, const char* id, const char* topic,
@@ -51,7 +64,7 @@ void mqttInit() {
 
     mqtt.setServer(config.mqtt_server, config.mqtt_port);
     mqtt.setCallback(mqttCallback);
-    mqtt.setBufferSize(1024);
+    mqtt.setBufferSize(1280);
     mqtt.setKeepAlive(30);
     mqtt.setSocketTimeout(5);
 
@@ -90,6 +103,7 @@ void mqttLoop() {
                 mqtt.publish(willTopic.c_str(), "online", true);
                 lastWaterPublish = 0;         // Publish all states right away
                 lastGasPublish = 0;
+                lastPumpPublish = 0;
             } else {
                 Serial.printf("[MQTT] Failed, rc=%d\n", mqtt.state());
             }
@@ -122,6 +136,14 @@ void mqttLoop() {
         lastGasPublish = millis();
         lastPublishedGasUpdate = sensorData.gas.updates;
         publishGasState();
+    }
+
+    // Pump: immediately on state changes, otherwise periodically
+    bool newPump = (sensorData.pump.updates != lastPublishedPumpUpdate);
+    if (config.pump_enabled && (newPump || lastPumpPublish == 0 || millis() - lastPumpPublish > MQTT_PUMP_MS)) {
+        lastPumpPublish = millis();
+        lastPublishedPumpUpdate = sensorData.pump.updates;
+        publishPumpState();
     }
 }
 
@@ -157,6 +179,22 @@ static void mqttCallback(char* topicName, byte* payload, unsigned int length) {
             saveConfig();
         }
         mqtt.publish(topic(tk.state).c_str(), tk.t->filter_active ? "ON" : "OFF", true);
+    }
+
+    // Water pump commands (queued, written to the pump in pumpLoop())
+    if (config.pump_enabled && topicStr.startsWith(topic("cmd/pump/"))) {
+        bool on = (payloadStr == "on" || payloadStr == "true" || payloadStr == "1");
+        if (topicStr == topic("cmd/pump/enable/set")) {
+            pumpSetEnabled(on);
+        } else if (topicStr == topic("cmd/pump/leak/set")) {
+            pumpSetLeakDetection(on);
+        } else if (topicStr == topic("cmd/pump/release/set")) {
+            pumpSetReleased(on);
+        } else if (topicStr == topic("cmd/pump/pressure_level/set")) {
+            // Accepts "2" as well as "Stufe 2" (select option)
+            int level = payloadStr.length() ? payloadStr.charAt(payloadStr.length() - 1) - '0' : 0;
+            pumpSetPressureLevel((uint8_t)level);
+        }
     }
 }
 
@@ -199,6 +237,44 @@ static void publishGasState() {
         mqtt.publish(topic("gas/battery").c_str(), buf, true);
     }
     mqtt.publish(topic("gas/ble_state").c_str(), g.ble_state, true);
+}
+
+static void publishFloat(const char* sub, float v, int decimals) {
+    char buf[16];
+    dtostrf(v, 1, decimals, buf);
+    mqtt.publish(topic(sub).c_str(), buf, true);
+}
+
+static void publishPumpState() {
+    const PumpData& p = sensorData.pump;
+    char buf[16];
+
+    mqtt.publish(topic("pump/state").c_str(), p.state, true);
+    mqtt.publish(topic("pump/available").c_str(), p.available ? "online" : "offline", true);
+    mqtt.publish(topic("pump/connected").c_str(), p.connected ? "ON" : "OFF", true);
+    mqtt.publish(topic("pump/release").c_str(), p.released ? "ON" : "OFF", true);
+
+    // Values only once a real status frame exists
+    if (!p.has_data) return;
+    mqtt.publish(topic("pump/enabled").c_str(), p.pump_enabled ? "ON" : "OFF", true);
+    mqtt.publish(topic("pump/leak").c_str(), p.leak_detection ? "ON" : "OFF", true);
+    mqtt.publish(topic("pump/running").c_str(), p.running ? "ON" : "OFF", true);
+    snprintf(buf, sizeof(buf), "Stufe %u", (unsigned)p.pressure_level);
+    mqtt.publish(topic("pump/pressure_level").c_str(), buf, true);
+
+    publishFloat("pump/voltage", p.voltage, 1);
+    publishFloat("pump/current", p.current, 1);
+    publishFloat("pump/temperature", p.temperature, 1);
+    publishFloat("pump/pressure", p.pressure, 2);
+    publishFloat("pump/flow", p.flow, 1);
+    itoa(p.daily_liters, buf, 10);
+    mqtt.publish(topic("pump/daily_liters").c_str(), buf, true);
+    itoa(p.total_liters, buf, 10);
+    mqtt.publish(topic("pump/total_liters").c_str(), buf, true);
+    if (p.connected) {
+        itoa(p.ble_rssi, buf, 10);
+        mqtt.publish(topic("pump/ble_rssi").c_str(), buf, true);
+    }
 }
 
 void mqttPublishDiscovery() {
@@ -250,6 +326,10 @@ void mqttPublishDiscovery() {
         for (const char* id : gasIds) removeEntity("sensor", id);
     }
 
+    // Water pump (optional, own HA device)
+    if (config.pump_enabled) publishPumpDiscovery();
+    else removePumpDiscovery();
+
     // Device
     publishSensor("WLAN Signal", "rssi",   "rssi",   "dBm", "signal_strength", "mdi:wifi",         true,  false);
     publishSensor("Status",      "status", "status", "",    "None",            "mdi:check-circle", false, true);
@@ -275,7 +355,7 @@ static void addDeviceBlock(JsonDocument& doc, bool withAvailability) {
 }
 
 static void publishJson(const String& configTopic, JsonDocument& doc, const char* id) {
-    char buffer[768];
+    char buffer[1024];
     size_t len = serializeJson(doc, buffer, sizeof(buffer));
     if (len == 0 || len >= sizeof(buffer)) {
         Serial.printf("[MQTT] Discovery payload for '%s' too large\n", id);
@@ -321,4 +401,116 @@ static void publishSwitch(const char* name, const char* id, const char* stateTop
 static void removeEntity(const char* component, const char* id) {
     String configTopic = String("homeassistant/") + component + "/" HA_NODE_ID "/" + id + "/config";
     mqtt.publish(configTopic.c_str(), "", true);
+}
+
+// ============================================================
+// Water pump discovery (device "CaraWater Pumpe", linked via via_device)
+// ============================================================
+
+// Pump device block. Availability: ESP online AND (optionally) pump reachable
+static void addPumpDevice(JsonDocument& doc, bool needsPump) {
+    JsonObject device = doc["device"].to<JsonObject>();
+    device["identifiers"][0] = HA_PUMP_ID;
+    device["name"] = "CaraWater Pumpe";
+    device["manufacturer"] = "CaraWater";
+    // The pump does not report its model; label from the web UI (optional)
+    device["model"] = config.pump_model[0] ? (const char*)config.pump_model : "Pumpe";
+    device["via_device"] = HA_NODE_ID;
+
+    JsonArray av = doc["availability"].to<JsonArray>();
+    JsonObject a1 = av.add<JsonObject>();
+    a1["topic"] = topic("status");
+    a1["payload_available"] = "online";
+    a1["payload_not_available"] = "offline";
+    if (needsPump) {
+        JsonObject a2 = av.add<JsonObject>();
+        a2["topic"] = topic("pump/available");
+        a2["payload_available"] = "online";
+        a2["payload_not_available"] = "offline";
+        doc["availability_mode"] = "all";
+    }
+}
+
+static void pumpEntity(JsonDocument& doc, const char* name, const char* id, const char* stateSub, const char* icon) {
+    doc["name"] = name;
+    doc["unique_id"] = String(HA_PUMP_ID "_") + id;
+    doc["state_topic"] = topic(stateSub);
+    if (icon) doc["icon"] = icon;
+}
+
+static void pumpSensor(const char* name, const char* id, const char* unit, const char* devClass,
+                       const char* stateClass, const char* icon, bool needsPump = true, bool enabled = true) {
+    JsonDocument doc;
+    String sub = String("pump/") + id;
+    pumpEntity(doc, name, id, sub.c_str(), icon);
+    if (unit) doc["unit_of_measurement"] = unit;
+    if (devClass) doc["device_class"] = devClass;
+    if (stateClass) doc["state_class"] = stateClass;
+    if (!enabled) doc["enabled_by_default"] = false;
+    addPumpDevice(doc, needsPump);
+    publishJson(String("homeassistant/sensor/" HA_NODE_ID "/pump_") + id + "/config", doc, id);
+}
+
+static void pumpBinary(const char* name, const char* id, const char* devClass, const char* icon, bool needsPump) {
+    JsonDocument doc;
+    String sub = String("pump/") + id;
+    pumpEntity(doc, name, id, sub.c_str(), icon);
+    doc["payload_on"] = "ON";
+    doc["payload_off"] = "OFF";
+    if (devClass) doc["device_class"] = devClass;
+    addPumpDevice(doc, needsPump);
+    publishJson(String("homeassistant/binary_sensor/" HA_NODE_ID "/pump_") + id + "/config", doc, id);
+}
+
+static void pumpSwitch(const char* name, const char* id, const char* stateSub, const char* cmdSub,
+                       const char* icon, bool needsPump) {
+    JsonDocument doc;
+    pumpEntity(doc, name, id, stateSub, icon);
+    doc["command_topic"] = topic(cmdSub);
+    doc["payload_on"] = "ON";
+    doc["payload_off"] = "OFF";
+    addPumpDevice(doc, needsPump);
+    publishJson(String("homeassistant/switch/" HA_NODE_ID "/pump_") + id + "/config", doc, id);
+}
+
+static void publishPumpDiscovery() {
+    pumpSensor("Spannung",         "voltage",      "V",     "voltage",         "measurement",      nullptr);
+    pumpSensor("Strom",            "current",      "A",     "current",         "measurement",      nullptr);
+    pumpSensor("Wassertemperatur", "temperature",  "°C",    "temperature",     "measurement",      nullptr);
+    pumpSensor("Wasserdruck",      "pressure",     "bar",   "pressure",        "measurement",      nullptr);
+    pumpSensor("Durchfluss",       "flow",         "L/min", "volume_flow_rate","measurement",      nullptr);
+    pumpSensor("Tagesverbrauch",   "daily_liters", "L",     "water",           "total_increasing", nullptr);
+    pumpSensor("Gesamtverbrauch",  "total_liters", "L",     "water",           "total_increasing", nullptr);
+    pumpSensor("Bluetooth Signal", "ble_rssi",     "dBm",   "signal_strength", "measurement",      "mdi:bluetooth", true, false);
+    pumpSensor("Status",           "state",        nullptr, nullptr,           nullptr,            "mdi:bluetooth-connect", false);
+
+    pumpBinary("Pumpe läuft", "running",   "running",      "mdi:water-pump",        true);
+    pumpBinary("Verbindung",  "connected", "connectivity", "mdi:bluetooth-connect", false);
+
+    pumpSwitch("Pumpenfreigabe",              "enable",  "pump/enabled", "cmd/pump/enable/set",  "mdi:water-pump",  true);
+    pumpSwitch("Leckage-Erkennung",           "leak",    "pump/leak",    "cmd/pump/leak/set",    "mdi:pipe-leak",   true);
+    pumpSwitch("Bluetooth für App freigeben", "release", "pump/release", "cmd/pump/release/set", "mdi:bluetooth-off", false);
+
+    // Constant pressure level as select
+    JsonDocument doc;
+    pumpEntity(doc, "Konstantdruck", "pressure_level", "pump/pressure_level", "mdi:gauge");
+    doc["command_topic"] = topic("cmd/pump/pressure_level/set");
+    JsonArray opts = doc["options"].to<JsonArray>();
+    opts.add("Stufe 1");
+    opts.add("Stufe 2");
+    opts.add("Stufe 3");
+    addPumpDevice(doc, true);
+    publishJson("homeassistant/select/" HA_NODE_ID "/pump_pressure_level/config", doc, "pressure_level");
+}
+
+static void removePumpDiscovery() {
+    const char* sensors[] = {"voltage", "current", "temperature", "pressure", "flow",
+                             "daily_liters", "total_liters", "ble_rssi", "state"};
+    for (const char* id : sensors) removeEntity("sensor", (String("pump_") + id).c_str());
+    removeEntity("binary_sensor", "pump_running");
+    removeEntity("binary_sensor", "pump_connected");
+    removeEntity("switch", "pump_enable");
+    removeEntity("switch", "pump_leak");
+    removeEntity("switch", "pump_release");
+    removeEntity("select", "pump_pressure_level");
 }

@@ -1,6 +1,7 @@
 #include "webserver.h"
 #include "wifi_manager.h"
 #include "gas_sensor.h"
+#include "pump_ble.h"
 #include "mqtt_ha.h"
 
 #include <WiFi.h>
@@ -77,6 +78,7 @@ static void setDefaults() {
     config.water_enabled = (WATER_ENABLED != 0);
     config.grey_enabled = (GREY_ENABLED != 0);
     config.gas_enabled = (GAS_ENABLED != 0);
+    config.pump_enabled = (PUMP_ENABLED != 0);
 
     // Water tanks
     setDefaultTank(config.fresh, DEFAULT_TANK_SIZE);
@@ -89,6 +91,10 @@ static void setDefaults() {
     config.capacity = DEFAULT_CAPACITY;
     config.fill_stop_on = DEFAULT_FILL_STOP_ON;
     config.fill_stop = DEFAULT_FILL_STOP;
+
+    // Water pump
+    memset(config.pump_mac, 0, sizeof(config.pump_mac));
+    strlcpy(config.pump_model, DEFAULT_PUMP_MODEL, sizeof(config.pump_model));
 }
 
 static bool isNumber(JsonVariantConst v) {
@@ -275,14 +281,32 @@ void webserverInit() {
             String("{\"filter\":\"") + (t.filter_active ? "ON" : "OFF") + "\"}");
     });
 
-    // Nearby BLE devices (for picking the gas sensor MAC in the web UI)
+    // Nearby BLE devices (for picking the gas sensor / pump MAC in the web UI)
     server.on("/api/scan", HTTP_GET, [](AsyncWebServerRequest* request) {
         JsonDocument doc;
         JsonArray arr = doc["devices"].to<JsonArray>();
-        if (config.gas_enabled) gasFillSeenList(arr);
+        if (config.gas_enabled || config.pump_enabled) gasFillSeenList(arr);
         String response;
         serializeJson(doc, response);
         request->send(200, "application/json", response);
+    });
+
+    // Water pump commands: /api/pump?cmd=enable|leak|release&on=1|0  or  ?cmd=level&level=1..3
+    // Commands are queued and written to the pump from loop()
+    server.on("/api/pump", HTTP_POST, [](AsyncWebServerRequest* request) {
+        if (!config.pump_enabled) { sendError(request, "Pump is disabled"); return; }
+        if (!request->hasParam("cmd")) { sendError(request, "Missing cmd"); return; }
+        String cmd = request->getParam("cmd")->value();
+        bool on = request->hasParam("on") && request->getParam("on")->value() == "1";
+        if (cmd == "enable")       pumpSetEnabled(on);
+        else if (cmd == "leak")    pumpSetLeakDetection(on);
+        else if (cmd == "release") pumpSetReleased(on);
+        else if (cmd == "level") {
+            int level = request->hasParam("level") ? request->getParam("level")->value().toInt() : 0;
+            if (level < 1 || level > 3) { sendError(request, "Level must be 1-3"); return; }
+            pumpSetPressureLevel((uint8_t)level);
+        } else { sendError(request, "Unknown cmd"); return; }
+        request->send(200, "application/json", "{\"status\":\"queued\"}");
     });
 }
 
@@ -354,6 +378,31 @@ void wsSendSensorData() {
     go["adv_count"] = g.adv_count;
     go["scanning"] = g.scanning;
 
+    if (config.pump_enabled) {
+        const PumpData& p = sensorData.pump;
+        JsonObject po = doc["pump"].to<JsonObject>();
+        po["state"] = (const char*)p.state;
+        po["connected"] = p.connected;
+        po["available"] = p.available;
+        po["released"] = p.released;
+        po["has_data"] = p.has_data;
+        po["enabled"] = p.pump_enabled;
+        po["leak"] = p.leak_detection;
+        po["level"] = p.pressure_level;
+        po["running"] = p.running;
+        po["voltage"] = round(p.voltage * 10.0f) / 10.0f;
+        po["current"] = round(p.current * 10.0f) / 10.0f;
+        po["temperature"] = round(p.temperature * 10.0f) / 10.0f;
+        po["pressure"] = round(p.pressure * 100.0f) / 100.0f;
+        po["flow"] = round(p.flow * 10.0f) / 10.0f;
+        po["daily"] = p.daily_liters;
+        po["total"] = p.total_liters;
+        po["ble_rssi"] = p.ble_rssi;
+        po["mtu"] = p.mtu;
+        po["status_raw"] = p.status_raw;
+        po["age"] = p.has_data ? (long)((millis() - p.last_update) / 1000) : -1;
+    }
+
     doc["rssi"] = sensorData.rssi;
     doc["uptime"] = millis() / 1000;
     doc["wifi_drops"] = sensorData.wifi_drops;
@@ -361,7 +410,7 @@ void wsSendSensorData() {
     doc["wifi"] = getWiFiStateString();
     doc["mqtt"] = mqttIsConnected();
 
-    static char buffer[1280];   // static: keeps it off the stack
+    static char buffer[1792];   // static: keeps it off the stack
     size_t len = serializeJson(doc, buffer, sizeof(buffer));
     if (len == 0 || len >= sizeof(buffer)) return;
     ws.textAll(buffer, len);
@@ -397,6 +446,7 @@ static void handleApiGetConfig(AsyncWebServerRequest* request) {
     doc["water_enabled"] = config.water_enabled;
     doc["grey_enabled"] = config.grey_enabled;
     doc["gas_enabled"] = config.gas_enabled;
+    doc["pump_enabled"] = config.pump_enabled;
 
     // Water tanks
     tankToJson(doc, "", config.fresh);
@@ -408,6 +458,10 @@ static void handleApiGetConfig(AsyncWebServerRequest* request) {
     doc["capacity"] = config.capacity;
     doc["fill_stop_on"] = config.fill_stop_on;
     doc["fill_stop"] = config.fill_stop;
+
+    // Water pump
+    doc["pump_mac"] = (const char*)config.pump_mac;
+    doc["pump_model"] = (const char*)config.pump_model;
 
     // Compile-time gas sensor definition (read-only in the web UI)
     JsonObject def = doc["sensor_def"].to<JsonObject>();
@@ -500,6 +554,17 @@ static void handleApiSaveConfig(AsyncWebServerRequest* request, uint8_t* data, s
     bool hasStopOn = doc["fill_stop_on"].is<bool>();
     bool newStopOn = hasStopOn ? doc["fill_stop_on"].as<bool>() : false;
 
+    // Water pump
+    bool hasPumpMac = doc["pump_mac"].is<const char*>();
+    char newPumpMac[18] = "";
+    if (hasPumpMac && !normalizeMac(doc["pump_mac"].as<const char*>(), newPumpMac, sizeof(newPumpMac))) {
+        sendError(request, "Invalid pump MAC address"); return;
+    }
+    bool hasPumpModel = doc["pump_model"].is<const char*>();
+    if (hasPumpModel && strlen(doc["pump_model"].as<const char*>()) >= sizeof(config.pump_model)) {
+        sendError(request, "Pump model too long"); return;
+    }
+
     // ---- Apply ----
 
     // Empty values clear SSID/server/user; empty passwords are ignored (= keep the stored one)
@@ -525,6 +590,7 @@ static void handleApiSaveConfig(AsyncWebServerRequest* request, uint8_t* data, s
     if (doc["water_enabled"].is<bool>()) config.water_enabled = doc["water_enabled"].as<bool>();
     if (doc["grey_enabled"].is<bool>())  config.grey_enabled = doc["grey_enabled"].as<bool>();
     if (doc["gas_enabled"].is<bool>())   config.gas_enabled = doc["gas_enabled"].as<bool>();
+    if (doc["pump_enabled"].is<bool>())  config.pump_enabled = doc["pump_enabled"].as<bool>();
 
     applyTank(config.fresh, freshUpd);
     // Another sender type: load its default table (unless a table was sent along)
@@ -541,6 +607,15 @@ static void handleApiSaveConfig(AsyncWebServerRequest* request, uint8_t* data, s
     if (hasCap && newCap != config.capacity)           { config.capacity = newCap;       gasTankChanged = true; }
     if (hasStopOn && newStopOn != config.fill_stop_on) { config.fill_stop_on = newStopOn; gasTankChanged = true; }
     if (hasStop && newStop != config.fill_stop)        { config.fill_stop = newStop;     gasTankChanged = true; }
+
+    if (hasPumpMac && strcmp(newPumpMac, config.pump_mac) != 0) {
+        strlcpy(config.pump_mac, newPumpMac, sizeof(config.pump_mac));
+        if (config.pump_enabled) pumpReset();   // Thread safe: only queues a reconnect
+    }
+    if (hasPumpModel && strcmp(doc["pump_model"].as<const char*>(), config.pump_model) != 0) {
+        strlcpy(config.pump_model, doc["pump_model"].as<const char*>(), sizeof(config.pump_model));
+        mqttRequestDiscovery();   // Only a flag; the HA device info is re-sent from loop()
+    }
 
     saveConfig();
     request->send(200, "application/json", "{\"status\":\"ok\"}");
@@ -594,6 +669,7 @@ void loadConfig() {
     config.water_enabled = doc["water_enabled"] | (WATER_ENABLED != 0);
     config.grey_enabled = doc["grey_enabled"] | (GREY_ENABLED != 0);
     config.gas_enabled = doc["gas_enabled"] | (GAS_ENABLED != 0);
+    config.pump_enabled = doc["pump_enabled"] | (PUMP_ENABLED != 0);
 
     // Water tanks (factory values are kept for anything missing or invalid)
     tankFromJson(doc, "", config.fresh);
@@ -612,6 +688,12 @@ void loadConfig() {
     config.fill_stop_on = doc["fill_stop_on"] | DEFAULT_FILL_STOP_ON;
     float stop = doc["fill_stop"] | DEFAULT_FILL_STOP;
     config.fill_stop = (stop >= 1.0f && stop <= 100.0f) ? stop : DEFAULT_FILL_STOP;
+
+    // Water pump
+    if (normalizeMac(doc["pump_mac"] | "", mac, sizeof(mac))) {
+        strlcpy(config.pump_mac, mac, sizeof(config.pump_mac));
+    }
+    strlcpy(config.pump_model, doc["pump_model"] | DEFAULT_PUMP_MODEL, sizeof(config.pump_model));
 }
 
 void saveConfig() {
@@ -633,6 +715,7 @@ void saveConfig() {
     doc["water_enabled"] = config.water_enabled;
     doc["grey_enabled"] = config.grey_enabled;
     doc["gas_enabled"] = config.gas_enabled;
+    doc["pump_enabled"] = config.pump_enabled;
 
     // Water tanks
     tankToJson(doc, "", config.fresh);
@@ -644,6 +727,10 @@ void saveConfig() {
     doc["capacity"] = config.capacity;
     doc["fill_stop_on"] = config.fill_stop_on;
     doc["fill_stop"] = config.fill_stop;
+
+    // Water pump
+    doc["pump_mac"] = (const char*)config.pump_mac;
+    doc["pump_model"] = (const char*)config.pump_model;
 
     // Write to a temp file first so a power loss cannot leave a half-written config
     const char* tmpPath = "/config.tmp";

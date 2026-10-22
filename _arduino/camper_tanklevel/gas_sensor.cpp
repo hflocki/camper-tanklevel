@@ -12,6 +12,8 @@ struct SeenDevice {
     char name[24];
     char svc[40];          // UUID of the first service data block ("" = none)
     int32_t company;       // Company ID of the first manufacturer data block (-1 = none)
+    bool pump;             // Advertises the CaraWater pump service (FF00)
+    uint8_t addrType;      // BLE address type (public / random), needed to connect to the pump
     uint8_t prio;          // List priority (see devicePriority)
     int rssi;
     unsigned long last;
@@ -31,6 +33,8 @@ static bool rawPending = false;
 
 static NimBLEScan* scan = nullptr;
 static volatile uint32_t advCount = 0;  // Advertisements received (diagnosis)
+static bool scanPaused = false;         // Scan held off while the pump connects
+static NimBLEUUID pumpServiceUuid(PUMP_SERVICE_UUID);
 
 // Compile-time sensor definition (see config.h)
 static const ValueMap MAP_LEVEL = {
@@ -95,21 +99,24 @@ static void storeRaw(const uint8_t* d, size_t n) {
 
 #define COMPANY_APPLE 0x004C
 
-// Higher = more important. Keeps the gas sensor in the list even when many phones are around.
-//   3 = configured sensor, 2 = company ID matches the sensor definition,
+// Higher = more important. Keeps the gas sensor / pump in the list even when many phones are around.
+//   3 = configured sensor or pump, 2 = company ID matches the sensor definition or pump service,
 //   1 = other device with data, 0 = Apple devices (rotating addresses) / no data
-static uint8_t devicePriority(const char* addr, const char* svc, int32_t company) {
-    if (config.sensor_mac[0] && strcmp(addr, config.sensor_mac) == 0) return 3;
-    if (SENSOR_SOURCE == SRC_MANUFACTURER && SENSOR_COMPANY_ID != COMPANY_ANY &&
+static uint8_t devicePriority(const char* addr, const char* svc, int32_t company, bool pump) {
+    if (config.gas_enabled && config.sensor_mac[0] && strcmp(addr, config.sensor_mac) == 0) return 3;
+    if (config.pump_enabled && config.pump_mac[0] && strcmp(addr, config.pump_mac) == 0) return 3;
+    if (config.pump_enabled && pump) return 2;
+    if (config.gas_enabled && SENSOR_SOURCE == SRC_MANUFACTURER && SENSOR_COMPANY_ID != COMPANY_ANY &&
         company == SENSOR_COMPANY_ID) return 2;
     if (company == COMPANY_APPLE) return 0;
     if (company >= 0 || svc[0] != '\0') return 1;
     return 0;
 }
 
-static void rememberDevice(const char* addr, const char* name, const char* svc, int32_t company, int rssi) {
+static void rememberDevice(const char* addr, const char* name, const char* svc, int32_t company,
+                           bool pump, uint8_t addrType, int rssi) {
     unsigned long now = millis();
-    uint8_t prio = devicePriority(addr, svc, company);
+    uint8_t prio = devicePriority(addr, svc, company, pump);
     int match = -1, freeSlot = -1, victim = -1;
 
     portENTER_CRITICAL(&dataMux);
@@ -139,12 +146,14 @@ static void rememberDevice(const char* addr, const char* name, const char* svc, 
         d.company = -1;
     }
     d.used = true;
+    d.addrType = addrType;
     d.rssi = rssi;
     d.last = now;
     if (company >= 0) d.company = company;
+    if (pump) d.pump = true;
     if (svc[0]) strlcpy(d.svc, svc, sizeof(d.svc));
     if (name && name[0]) strlcpy(d.name, name, sizeof(d.name));
-    d.prio = devicePriority(d.addr, d.svc, d.company);
+    d.prio = devicePriority(d.addr, d.svc, d.company, d.pump);
     portEXIT_CRITICAL(&dataMux);
 }
 
@@ -194,8 +203,11 @@ class ScanCallbacks : public NimBLEScanCallbacks {
             strlcpy(svc, dev->getServiceDataUUID(0).toString().c_str(), sizeof(svc));
         }
         std::string name = dev->haveName() ? dev->getName() : std::string();
-        rememberDevice(addr, name.c_str(), svc, company, dev->getRSSI());
+        bool pump = dev->haveServiceUUID() && dev->isAdvertisingService(pumpServiceUuid);
+        rememberDevice(addr, name.c_str(), svc, company, pump, dev->getAddress().getType(), dev->getRSSI());
 
+        // The scanner also runs for the pump device list; decode gas data only if gas is enabled
+        if (!config.gas_enabled) return;
         if (config.sensor_mac[0] == '\0' || strcmp(addr, config.sensor_mac) != 0) return;
 
         // Find the payload: manufacturer data (without the 2 company ID bytes) or service data
@@ -237,7 +249,7 @@ class ScanCallbacks : public NimBLEScanCallbacks {
 static ScanCallbacks scanCallbacks;
 
 static void startScan() {
-    if (!scan || scan->isScanning()) return;
+    if (!scan || scanPaused || scan->isScanning()) return;
     // 0 = scan forever, results are not stored (setMaxResults(0)) to save RAM
     if (!scan->start(0, false, true)) {
         Serial.println("[BLE] Scan start FAILED");
@@ -265,6 +277,11 @@ bool gasInit() {
     scan->setMaxResults(0);
     startScan();
 
+    if (!config.gas_enabled) {
+        // Scanner only runs for the device list of the pump tab
+        strlcpy(sensorData.gas.ble_state, "Deaktiviert", sizeof(sensorData.gas.ble_state));
+        return true;
+    }
     strlcpy(sensorData.gas.ble_state, "Warte auf Daten", sizeof(sensorData.gas.ble_state));
     Serial.printf("[BLE] Sensor: %s  MAC: %s  Source: %u\n", SENSOR_MODEL,
         config.sensor_mac[0] ? config.sensor_mac : "(not set)", (unsigned)SENSOR_SOURCE);
@@ -307,6 +324,8 @@ void gasLoop() {
         startScan();
     }
 
+    if (!config.gas_enabled) return;   // Scanner only (pump device list)
+
     // Human readable state
     const unsigned long timeout = DATA_TIMEOUT_MS;
     const char* state;
@@ -315,6 +334,30 @@ void gasLoop() {
     else if (millis() - sensorData.gas.last_update > timeout) state = "Keine Daten";
     else                                                  state = "OK";
     strlcpy(sensorData.gas.ble_state, state, sizeof(sensorData.gas.ble_state));
+}
+
+bool gasFindAddrType(const char* mac, uint8_t* type) {
+    bool found = false;
+    portENTER_CRITICAL(&dataMux);
+    for (int i = 0; i < BLE_MAX_SEEN; i++) {
+        if (seen[i].used && strcmp(seen[i].addr, mac) == 0) {
+            *type = seen[i].addrType;
+            found = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&dataMux);
+    return found;
+}
+
+void gasScanPause() {
+    scanPaused = true;
+    if (scan && scan->isScanning()) scan->stop();
+}
+
+void gasScanResume() {
+    scanPaused = false;
+    startScan();
 }
 
 void gasReset() {
@@ -367,6 +410,7 @@ void gasFillSeenList(JsonArray arr) {
                 o["mfg"] = "";
             }
             o["svc"] = (const char*)d.svc;
+            o["pump"] = d.pump;
             o["age"] = (now - d.last) / 1000;
         }
     }

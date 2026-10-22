@@ -14,6 +14,7 @@
     --water-glow: rgba(0,212,170,0.3);
     --gas: #ff9f43;
     --grey: #a3adb8;
+    --pump: #4da3ff;
     --accent: var(--water);
     --warning: #ffb800;
     --danger: #ff4757;
@@ -40,7 +41,7 @@ body {
 .status-dot.active { background: var(--success); box-shadow: 0 0 8px var(--water-glow); }
 .status-dot.warning { background: var(--warning); }
 .tabs { display: flex; background: var(--bg-secondary); border-bottom: 1px solid var(--border); overflow-x: auto; }
-/* Icon above the label: all tabs fit even on small phones (320 px) */
+/* Icon above the label: 7 tabs fit even on small phones (320 px) */
 .tab {
     flex: 1; min-width: 0; padding: 8px 1px 7px; text-align: center; font-size: 0.68rem; font-weight: 500; line-height: 1.2;
     display: flex; flex-direction: column; align-items: center; gap: 3px;
@@ -167,6 +168,20 @@ code { font-family: ui-monospace, Menlo, monospace; }
 .toggle span::before { content: ''; position: absolute; width: 20px; height: 20px; left: 3px; top: 3px; background: var(--text-primary); border-radius: 50%; transition: 0.2s; }
 .toggle input:checked + span { background: var(--water); }
 .toggle.gas input:checked + span { background: var(--gas); }
+.toggle.pump input:checked + span { background: var(--pump); }
+.tab.pump.active { color: var(--pump); border-bottom-color: var(--pump); background: rgba(77,163,255,0.06); }
+.card-title.pump { color: var(--pump); }
+.btn-pump { background: var(--pump); color: var(--bg-primary); }
+.dev.pump-match { border-left: 3px solid var(--pump); }
+.dev.pump-current { outline: 1px solid var(--pump); }
+.badge.pump { background: rgba(77,163,255,0.15); color: var(--pump); }
+.pill { display: inline-block; font-size: 0.7rem; font-weight: 700; padding: 2px 8px; border-radius: 10px; background: var(--bg-input); color: var(--text-secondary); }
+.pill.on { background: rgba(77,163,255,0.18); color: var(--pump); }
+.pill.warn { background: rgba(255,184,0,0.15); color: var(--warning); }
+.ctrl-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
+.ctrl-row:last-of-type { border-bottom: none; }
+.ctrl-row select { padding: 6px 10px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px; color: var(--text-primary); font-size: 0.85rem; }
+.disabled-box { opacity: 0.45; pointer-events: none; }
 .toggle input:checked + span::before { transform: translateX(20px); }
 
 .toast { position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%) translateY(100px); background: var(--bg-card); border: 1px solid var(--accent); border-radius: 8px; padding: 10px 20px; font-size: 0.85rem; color: var(--accent); opacity: 0; transition: all 0.3s; z-index: 999; }
@@ -197,6 +212,7 @@ code { font-family: ui-monospace, Menlo, monospace; }
         <div class="tab" data-tab="water"><span class="ico">💧</span><span>Wasser</span></div>
         <div class="tab grey" data-tab="grey"><span class="ico">🚿</span><span>Grau</span></div>
         <div class="tab gas" data-tab="gas"><span class="ico">🔥</span><span>Gas</span></div>
+        <div class="tab pump" data-tab="pump"><span class="ico">🚰</span><span>Pumpe</span></div>
         <div class="tab" data-tab="mqtt"><span class="ico">⚙️</span><span>MQTT</span></div>
         <div class="tab" data-tab="wifi"><span class="ico">📶</span><span>WiFi</span></div>
     </div>
@@ -256,6 +272,16 @@ code { font-family: ui-monospace, Menlo, monospace; }
             <div class="info-row"><span class="info-label">Batterie Sensor</span><span id="g-battery">--</span></div>
             <div class="info-row"><span class="info-label">Bluetooth Signal</span><span id="g-blerssi">--</span></div>
             <div class="info-row"><span class="info-label">Letzter Wert</span><span id="g-age">--</span></div>
+        </div>
+
+        <div class="card" id="live-pump">
+            <div class="card-title pump">Wasserpumpe</div>
+            <div class="info-row"><span class="info-label">Status</span><span id="p-state">--</span></div>
+            <div class="info-row"><span class="info-label">Pumpe</span><span id="p-running">--</span></div>
+            <div class="info-row"><span class="info-label">Wasserdruck</span><span id="p-pressure">--</span></div>
+            <div class="info-row"><span class="info-label">Durchfluss</span><span id="p-flow">--</span></div>
+            <div class="info-row"><span class="info-label">Wassertemperatur</span><span id="p-temp">--</span></div>
+            <div class="info-row"><span class="info-label">Tagesverbrauch</span><span id="p-daily">--</span></div>
         </div>
     </div>
 
@@ -368,7 +394,7 @@ code { font-family: ui-monospace, Menlo, monospace; }
             <div class="enable-row">
                 <div>
                     <div class="card-title gas" style="margin-bottom:4px">Gassensor</div>
-                    <div class="form-hint" style="margin-top:0">Aus = Bluetooth wird nicht gestartet</div>
+                    <div class="form-hint" style="margin-top:0">Aus = kein Gas-Scan (Bluetooth nur noch für die Pumpe)</div>
                 </div>
                 <label class="toggle gas"><input type="checkbox" id="cfg-gas-enabled" onchange="setEnabled('gas', this)"><span></span></label>
             </div>
@@ -421,6 +447,76 @@ code { font-family: ui-monospace, Menlo, monospace; }
             <div class="card-title gas">Sensor-Definition (config.h)</div>
             <div id="def-rows"></div>
             <div class="form-hint" style="margin-top:8px">Für andere Sensoren den Block <b>GAS SENSOR DEFINITION</b> in <code>config.h</code> anpassen und neu flashen.</div>
+        </div>
+        </div>
+    </div>
+
+    <!-- PUMP TAB -->
+    <div class="tab-content" id="tab-pump">
+        <div class="card">
+            <div class="enable-row">
+                <div>
+                    <div class="card-title pump" style="margin-bottom:4px">Wasserpumpe</div>
+                    <div class="form-hint" style="margin-top:0">CaraWater-Pumpe über Bluetooth (Verbindung, optional)</div>
+                </div>
+                <label class="toggle pump"><input type="checkbox" id="cfg-pump-enabled" onchange="setEnabled('pump', this)"><span></span></label>
+            </div>
+        </div>
+
+        <div id="pump-settings">
+        <div class="card">
+            <div class="card-title pump">Steuerung</div>
+            <div id="pump-controls">
+                <div class="ctrl-row"><span>Pumpenfreigabe</span>
+                    <label class="toggle pump"><input type="checkbox" id="p-enable" onchange="pumpCmd('enable', this.checked)"><span></span></label></div>
+                <div class="ctrl-row"><span>Leckage-Erkennung</span>
+                    <label class="toggle pump"><input type="checkbox" id="p-leak" onchange="pumpCmd('leak', this.checked)"><span></span></label></div>
+                <div class="ctrl-row"><span>Konstantdruck</span>
+                    <select id="p-level" onchange="pumpLevel(this.value)">
+                        <option value="1">Stufe 1</option><option value="2">Stufe 2</option><option value="3">Stufe 3</option>
+                    </select></div>
+            </div>
+            <div class="form-hint" id="p-ctrl-hint">Steuerung nur möglich, wenn die Pumpe verbunden ist.</div>
+        </div>
+
+        <div class="card">
+            <div class="card-title pump">Bluetooth für App freigeben</div>
+            <div class="info-row"><span class="info-label">Status</span><span id="p-release-state">--</span></div>
+            <div class="form-hint">Die Pumpe erlaubt nur eine Bluetooth-Verbindung. Zum Einstellen per CaraWater-App trennt sich der ESP hier. Nach 30 min verbindet er sich automatisch wieder.</div>
+            <div class="btn-row"><button class="btn btn-secondary" id="p-release-btn" onclick="toggleRelease()">Freigeben</button></div>
+        </div>
+
+        <div class="card">
+            <div class="card-title pump">Pumpendaten</div>
+            <div class="info-row"><span class="info-label">Verbindung</span><span id="p-conn">--</span></div>
+            <div class="info-row"><span class="info-label">Spannung</span><span id="p-voltage">--</span></div>
+            <div class="info-row"><span class="info-label">Strom</span><span id="p-current">--</span></div>
+            <div class="info-row"><span class="info-label">Gesamtverbrauch</span><span id="p-total">--</span></div>
+            <div class="info-row"><span class="info-label">Bluetooth Signal</span><span id="p-rssi">--</span></div>
+            <div class="info-row"><span class="info-label">Status-Byte / MTU</span><span id="p-raw">--</span></div>
+            <div class="info-row"><span class="info-label">Letzter Wert</span><span id="p-age">--</span></div>
+        </div>
+
+        <div class="card">
+            <div class="card-title pump">Pumpe auswählen</div>
+            <div class="form-group">
+                <label>MAC-Adresse</label>
+                <input type="text" id="cfg-pump-mac" placeholder="AA:BB:CC:11:22:33" autocapitalize="characters" spellcheck="false">
+                <div class="form-hint">Oder unten aus der Liste übernehmen. Leer = keine Pumpe.</div>
+            </div>
+            <div class="form-group">
+                <label>Modell (optional)</label>
+                <input type="text" id="cfg-pump-model" list="pump-models" maxlength="23" placeholder="z. B. ISP 15" spellcheck="false">
+                <datalist id="pump-models"><option value="ISP 15"><option value="ISP 20"></datalist>
+                <div class="form-hint">Nur Anzeige in Home Assistant, die Pumpe meldet ihr Modell nicht. Getestet ist das Protokoll der ISP 15.</div>
+            </div>
+            <div class="btn-row"><button class="btn btn-pump" onclick="savePumpMac()">💾 Pumpe speichern</button></div>
+        </div>
+
+        <div class="card">
+            <div class="card-title pump">Bluetooth-Geräte in der Nähe</div>
+            <div class="dev-list" id="pump-dev-list"><div class="empty">Suche läuft...</div></div>
+            <div class="form-hint" style="margin-top:8px">Hervorgehoben: Gerät meldet den Pumpen-Dienst (FF00). Liste aktualisiert sich alle 5 s.</div>
         </div>
         </div>
     </div>
@@ -502,10 +598,11 @@ const TANKS = {
     grey:  { key: 'grey_', rows: 'grey-matrix-rows', size: 'cfg-grey-tank-size', filter: 'gr-filter', api: '/api/filter?tank=grey', calib: [] },
 };
 let currentMac = '';
+let currentPumpMac = '';
 let def = null;          // Compile-time gas sensor definition from the device
 let scanTimer = null;
 let lastRawHex = null;
-const enabled = { water: true, grey: false, gas: true };
+const enabled = { water: true, grey: false, gas: true, pump: false };
 
 const $ = (id) => document.getElementById(id);
 
@@ -515,9 +612,12 @@ document.querySelectorAll('.tab').forEach(tab => {
         document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
         tab.classList.add('active');
         $('tab-' + tab.dataset.tab).classList.add('active');
-        // Poll the nearby BLE device list only while the gas tab is open
+        // Poll the nearby BLE device list only while the gas or pump tab is open
         clearInterval(scanTimer);
-        if (tab.dataset.tab === 'gas' && enabled.gas) { loadScan(); scanTimer = setInterval(loadScan, 5000); }
+        const t = tab.dataset.tab;
+        if ((t === 'gas' && enabled.gas) || (t === 'pump' && enabled.pump)) {
+            loadScan(); scanTimer = setInterval(loadScan, 5000);
+        }
     });
 });
 
@@ -590,8 +690,13 @@ function updateLiveData(d) {
     $('scan-state').textContent = (g.scanning ? 'läuft' : 'AUS') + ' · ' + (g.adv_count || 0) + ' Pakete empfangen';
     if (g.raw_hex !== lastRawHex) { lastRawHex = g.raw_hex; renderRawBytes(g.raw_hex); }
 
+    // Pump
+    if (d.pump) updatePump(d.pump);
+
     // Connection
-    $('dot-ble').className = 'status-dot ' + (ok ? 'active' : (g.has_data ? 'warning' : ''));
+    const bleOk = enabled.gas ? ok : (d.pump && d.pump.available);
+    const bleWarn = enabled.gas ? g.has_data : (d.pump && d.pump.connected);
+    $('dot-ble').className = 'status-dot ' + (bleOk ? 'active' : (bleWarn ? 'warning' : ''));
     $('dot-wifi').className = 'status-dot ' + (d.wifi === 'Verbunden' ? 'active' : '');
     $('dot-mqtt').className = 'status-dot ' + (d.mqtt ? 'active' : '');
     $('wifi-state').textContent = d.wifi;
@@ -637,6 +742,7 @@ async function loadSetup() {
         enabled.water = cfg.water_enabled !== false;
         enabled.grey = cfg.grey_enabled === true;
         enabled.gas = cfg.gas_enabled !== false;
+        enabled.pump = cfg.pump_enabled === true;
         applyEnabled();
 
         // Water tanks
@@ -659,6 +765,11 @@ async function loadSetup() {
         def = cfg.sensor_def || null;
         renderDef();
         renderRawBytes(lastRawHex);
+
+        // Pump
+        $('cfg-pump-mac').value = cfg.pump_mac || '';
+        $('cfg-pump-model').value = cfg.pump_model || '';
+        currentPumpMac = cfg.pump_mac || '';
     } catch (e) { showToast('Fehler beim Laden'); }
 }
 
@@ -673,16 +784,20 @@ function applyEnabled() {
         $('gauge-' + kind).classList.toggle('hidden', !on);
         $('live-' + kind).classList.toggle('hidden', !on);
     }
+    $('cfg-pump-enabled').checked = enabled.pump;
+    $('pump-settings').classList.toggle('hidden', !enabled.pump);
+    $('live-pump').classList.toggle('hidden', !enabled.pump);
+
     const count = ['water', 'grey', 'gas'].filter(k => enabled[k]).length;
     const gauges = $('gauges');
     gauges.classList.toggle('cols-1', count === 1);
     gauges.classList.toggle('cols-3', count === 3);
     gauges.parentElement.classList.toggle('hidden', count === 0);
-    $('live-none').classList.toggle('hidden', count > 0);
-    $('ble-indicator').classList.toggle('hidden', !enabled.gas);
+    $('live-none').classList.toggle('hidden', count > 0 || enabled.pump);
+    $('ble-indicator').classList.toggle('hidden', !enabled.gas && !enabled.pump);
 }
 
-const SENSOR_LABELS = { water: 'Frischwasser-Sensor', grey: 'Grauwasser-Sensor', gas: 'Gassensor' };
+const SENSOR_LABELS = { water: 'Frischwasser-Sensor', grey: 'Grauwasser-Sensor', gas: 'Gassensor', pump: 'Wasserpumpe' };
 
 // Saves the switch and restarts the device (sensors are only started at boot)
 async function setEnabled(kind, el) {
@@ -921,14 +1036,18 @@ async function loadScan() {
     try {
         const resp = await fetch('/api/scan');
         if (!resp.ok) return;
-        renderDevices((await resp.json()).devices || []);
+        const devs = (await resp.json()).devices || [];
+        if (enabled.gas) renderDevices(devs, 'gas');
+        if (enabled.pump) renderDevices(devs, 'pump');
     } catch (e) {}
 }
 
 // Built with DOM nodes, not innerHTML: BLE device names come from foreign devices
-function renderDevices(devs) {
-    const list = $('dev-list');
+function renderDevices(devs, kind) {
+    const isPump = kind === 'pump';
+    const list = $(isPump ? 'pump-dev-list' : 'dev-list');
     list.replaceChildren();
+    if (isPump) devs = devs.slice().sort((a, b) => (b.mac === currentPumpMac) - (a.mac === currentPumpMac) || (b.pump === true) - (a.pump === true));
     if (!devs.length) {
         const e = document.createElement('div');
         e.className = 'empty'; e.textContent = 'Noch keine Geräte gefunden';
@@ -937,11 +1056,20 @@ function renderDevices(devs) {
     }
     devs.forEach(d => {
         const row = document.createElement('div');
-        const match = def && def.source === 0 && def.company && d.mfg === def.company;
-        row.className = 'dev' + (d.mac === currentMac ? ' current' : '') + (match ? ' match' : '');
+        if (isPump) {
+            row.className = 'dev' + (d.mac === currentPumpMac ? ' pump-current' : '') + (d.pump ? ' pump-match' : '');
+        } else {
+            const match = def && def.source === 0 && def.company && d.mfg === def.company;
+            row.className = 'dev' + (d.mac === currentMac ? ' current' : '') + (match ? ' match' : '');
+        }
 
         const main = document.createElement('div'); main.className = 'dev-main';
         const mac = document.createElement('div'); mac.className = 'dev-mac'; mac.textContent = d.mac;
+        if (d.pump) {
+            const b = document.createElement('span');
+            b.className = 'badge pump'; b.textContent = 'PUMPE'; b.title = 'Meldet den Pumpen-Dienst FF00';
+            mac.appendChild(b);
+        }
         if (d.mfg) {
             const b = document.createElement('span');
             b.className = 'badge'; b.textContent = '0x' + d.mfg; b.title = 'Hersteller-ID';
@@ -960,11 +1088,85 @@ function renderDevices(devs) {
 
         const btn = document.createElement('button');
         btn.className = 'btn btn-secondary btn-small'; btn.textContent = 'Übernehmen';
-        btn.onclick = () => { $('cfg-mac').value = d.mac; showToast('MAC übernommen - bitte speichern'); };
+        btn.onclick = () => { $(isPump ? 'cfg-pump-mac' : 'cfg-mac').value = d.mac; showToast('MAC übernommen - bitte speichern'); };
 
         row.append(main, rssi, btn);
         list.appendChild(row);
     });
+}
+
+// ---------- Water pump ----------
+
+let pumpReleased = false;
+let pumpBusyUntil = 0;   // Do not overwrite controls right after a click (until the pump confirms)
+
+const fmt = (v, dec, unit) => (v === undefined || v === null) ? '--' : Number(v).toFixed(dec) + ' ' + unit;
+
+function updatePump(p) {
+    const has = p.has_data;
+    $('p-state').textContent = p.state || '--';
+    $('p-running').textContent = has ? (p.running ? 'läuft' : 'aus') : '--';
+    $('p-pressure').textContent = has ? fmt(p.pressure, 2, 'bar') : '--';
+    $('p-flow').textContent = has ? fmt(p.flow, 1, 'l/min') : '--';
+    $('p-temp').textContent = has ? fmt(p.temperature, 1, '°C') : '--';
+    $('p-daily').textContent = has ? p.daily + ' L' : '--';
+
+    $('p-conn').textContent = p.released ? 'getrennt (App)' : (p.connected ? 'verbunden' : 'getrennt');
+    $('p-voltage').textContent = has ? fmt(p.voltage, 1, 'V') : '--';
+    $('p-current').textContent = has ? fmt(p.current, 1, 'A') : '--';
+    $('p-total').textContent = has ? p.total + ' L' : '--';
+    $('p-rssi').textContent = p.connected && p.ble_rssi ? p.ble_rssi + ' dBm' : '--';
+    $('p-raw').textContent = has ? '0x' + Number(p.status_raw).toString(16).toUpperCase().padStart(2, '0') + ' / ' + (p.mtu || '--') : '--';
+    $('p-age').textContent = formatAge(p.age);
+
+    pumpReleased = !!p.released;
+    $('p-release-state').textContent = pumpReleased ? 'freigegeben - ESP getrennt' : 'ESP verbunden bzw. verbindet';
+    $('p-release-btn').textContent = pumpReleased ? 'Wieder verbinden' : 'Freigeben';
+
+    $('pump-controls').classList.toggle('disabled-box', !p.available);
+    $('p-ctrl-hint').classList.toggle('hidden', !!p.available);
+    if (has && Date.now() > pumpBusyUntil) {
+        $('p-enable').checked = !!p.enabled;
+        $('p-leak').checked = !!p.leak;
+        if (p.level >= 1 && p.level <= 3) $('p-level').value = String(p.level);
+    }
+}
+
+async function postPump(query) {
+    pumpBusyUntil = Date.now() + 3000;
+    const resp = await fetch('/api/pump?' + query, { method: 'POST' });
+    if (!resp.ok) {
+        let msg = 'HTTP ' + resp.status;
+        try { msg = (await resp.json()).error || msg; } catch (e) {}
+        throw new Error(msg);
+    }
+}
+
+async function pumpCmd(cmd, on) {
+    try { await postPump('cmd=' + cmd + '&on=' + (on ? 1 : 0)); }
+    catch (e) { pumpBusyUntil = 0; showToast('Fehler: ' + e.message); }
+}
+
+async function pumpLevel(level) {
+    try { await postPump('cmd=level&level=' + level); }
+    catch (e) { pumpBusyUntil = 0; showToast('Fehler: ' + e.message); }
+}
+
+async function toggleRelease() {
+    try {
+        await postPump('cmd=release&on=' + (pumpReleased ? 0 : 1));
+        showToast(pumpReleased ? 'Verbinde wieder...' : 'Bluetooth für App freigegeben');
+    } catch (e) { showToast('Fehler: ' + e.message); }
+}
+
+async function savePumpMac() {
+    const mac = $('cfg-pump-mac').value.trim();
+    if (!isValidMac(mac)) { showToast('Ungültige MAC-Adresse'); return; }
+    try {
+        await postConfig({ pump_mac: mac, pump_model: $('cfg-pump-model').value.trim() });
+        showToast('✓ Pumpe gespeichert');
+        loadSetup();
+    } catch (e) { showToast('Fehler: ' + e.message); }
 }
 
 // ---------- MQTT / WiFi ----------

@@ -5,6 +5,7 @@ Eine Firmware für **einen** ESP32-C3 (oder klassischen ESP32), die zwei Projekt
 - **Frischwasser** aus [camper-waterlevel](https://github.com/hflocki/camper-waterlevel): Votronic-Tankgeber am analogen Eingang, Volt-zu-Füllstand-Matrix, Glättungsfilter
 - **Grauwasser** (optional): zweiter Votronic-Geber, wahlweise Tankelektrode (wie Frischwasser) oder kapazitiver Tank-Sensor FL, mit eigener Tankgröße, Matrix und Filter
 - **Gas** aus [camper-gaslevel](https://github.com/hflocki/camper-gaslevel): BLE-Gassensor (Standard: Rotarex DIMES / SRG WAVE), passiv über Bluetooth-Advertising, Füllstopp-Berechnung
+- **Wasserpumpe** (optional): CaraWater-Pumpe (ISP 15) über Bluetooth – Druck, Durchfluss, Temperatur, Verbrauch auslesen sowie Pumpenfreigabe, Leckage-Erkennung und Konstantdruck schalten
 
 Alle Werte gehen per **MQTT** (mit Home-Assistant-Discovery) raus und sind in einer gemeinsamen **Web-Oberfläche** zu sehen und einzustellen. Jeder Sensor lässt sich einzeln ein- und ausschalten.
 
@@ -30,6 +31,12 @@ Alle Werte gehen per **MQTT** (mit Home-Assistant-Discovery) raus und sind in ei
 | --- | --- |
 | <img src="images/tab-grey.png" width="240"> | <img src="images/tab-grey-fl.png" width="240"> |
 
+**Wasserpumpe (optional)**
+
+| Live mit Pumpe | Pumpe verbunden | Bluetooth für App freigegeben |
+| --- | --- | --- |
+| <img src="images/tab-live-pump.png" width="240"> | <img src="images/tab-pump.png" width="240"> | <img src="images/tab-pump-released.png" width="240"> |
+
 | MQTT | WiFi |
 | --- | --- |
 | <img src="images/tab-mqtt.png" width="240"> | <img src="images/tab-wifi.png" width="240"> |
@@ -50,6 +57,7 @@ _platformio/                 platformio.ini, nutzt dieselben Quellen
 | `config.h` | Pins, Standardwerte, **GAS SENSOR DEFINITION** (Byte-Zuordnung) |
 | `water_sensor.cpp` | ADC für Frisch- und Grauwasser, gleitender Mittelwert, Interpolation über die Matrix |
 | `gas_sensor.cpp` | NimBLE-Scan, Dekodierung, Geräteliste, Füllstopp |
+| `pump_ble.cpp` | CaraWater-Wasserpumpe: BLE-Verbindung, Statusframes, Steuerbefehle |
 | `mqtt_ha.cpp` | MQTT, HA-Discovery, Filter-Schalter |
 | `webserver.cpp` | Web-UI (gzip), REST-API, Konfiguration in LittleFS |
 | `wifi_manager.cpp` | WLAN mit AP-Fallback (Modem-Sleep für WiFi/BLE-Koexistenz) |
@@ -63,6 +71,7 @@ _platformio/                 platformio.ini, nutzt dieselben Quellen
 | Frischwasser (Votronic-Tankgeber) | **GPIO0** | **GPIO1** | GPIO34 | `ADC_PIN` |
 | Grauwasser (Votronic-Tankgeber, optional) | **GPIO1** | **GPIO2** | GPIO35 | `GREY_ADC_PIN` |
 | Gas (BLE) | keine Verkabelung, eingebautes Bluetooth | | | |
+| Wasserpumpe (BLE, optional) | keine Verkabelung, eingebautes Bluetooth | | | |
 
 Beide Tankeingänge müssen ADC1-Pins sein (ADC2 funktioniert nicht, solange WLAN aktiv ist). GPIO2 beim C3 nicht verwenden, das ist ein Boot-Pin. Beim S3 ist GPIO0 ein Boot-Pin ohne ADC, deshalb dort GPIO1/GPIO2. Verkabelung der Tankgeber wie im [camper-waterlevel](https://github.com/hflocki/camper-waterlevel#verkabelung) beschrieben, der Grauwasser-Geber bekommt eine eigene, gleich aufgebaute Messschaltung.
 
@@ -223,8 +232,17 @@ Prefix (Web-UI) Standard `camper/tanklevel`:
 | `<prefix>/cmd/grey/filter/set` | `ON` / `OFF` / `TOGGLE` |
 | `<prefix>/gas/level`, `raw_level`, `content` | Gas (nur nach erstem gültigen Wert) |
 | `<prefix>/gas/battery`, `ble_rssi`, `ble_state` | Gassensor |
+| `<prefix>/pump/state`, `available`, `connected` | Wasserpumpe: Verbindungsstatus (nur wenn eingeschaltet) |
+| `<prefix>/pump/voltage`, `current`, `temperature`, `pressure`, `flow` | Wasserpumpe: Messwerte |
+| `<prefix>/pump/daily_liters`, `total_liters`, `ble_rssi` | Wasserpumpe: Verbrauch, Signal |
+| `<prefix>/pump/enabled`, `leak`, `running`, `release` | `ON` / `OFF` |
+| `<prefix>/pump/pressure_level` | `Stufe 1` … `Stufe 3` |
+| `<prefix>/cmd/pump/enable/set` | `ON` / `OFF` (Pumpenfreigabe) |
+| `<prefix>/cmd/pump/leak/set` | `ON` / `OFF` (Leckage-Erkennung) |
+| `<prefix>/cmd/pump/pressure_level/set` | `1`–`3` oder `Stufe 1`–`Stufe 3` |
+| `<prefix>/cmd/pump/release/set` | `ON` / `OFF` (Bluetooth für App freigeben) |
 
-In Home Assistant erscheint **ein** Gerät „Camper Tanklevel“ mit allen Entitäten.
+In Home Assistant erscheint **ein** Gerät „Camper Tanklevel“ mit allen Tank-Entitäten. Ist die Wasserpumpe eingeschaltet, kommt ein zweites Gerät „CaraWater Pumpe“ dazu (verknüpft über „Verbunden über Camper Tanklevel“).
 
 **Umstieg von den Einzelprojekten:** Die alten Geräte „Camper Wasserlevel Sensor“ und „Camper Gaslevel Sensor“ bleiben in HA stehen, weil ihre Discovery-Nachrichten retained sind. Zum Entfernen in HA unter *Einstellungen → Geräte* löschen oder die Topics `homeassistant/sensor/camper_water/#`, `homeassistant/switch/camper_water/#` und `homeassistant/sensor/camper_gaslevel/#` mit leerer Nachricht (retained) überschreiben.
 
@@ -251,10 +269,42 @@ Frischwasser und Gas sind standardmäßig an, Grauwasser ist aus. Jede Kombinati
   #define WATER_ENABLED         1      // 1 = on, 0 = off
   #define GREY_ENABLED          0      // 1 = on, 0 = off
   #define GAS_ENABLED           1      // 1 = on, 0 = off
+  #define PUMP_ENABLED          0      // 1 = on, 0 = off
   ```
-- **In der Web-UI:** oben im Tab **Wasser**, **Grau** bzw. **Gas** gibt es einen Schalter. Danach startet das Gerät neu.
+- **In der Web-UI:** oben im Tab **Wasser**, **Grau**, **Gas** bzw. **Pumpe** gibt es einen Schalter. Danach startet das Gerät neu.
 
-Ein ausgeschalteter Sensor verschwindet von der Live-Seite und aus Home Assistant (die Entitäten werden per MQTT entfernt). Ist Gas aus, wird Bluetooth gar nicht gestartet.
+Ein ausgeschalteter Sensor verschwindet von der Live-Seite und aus Home Assistant (die Entitäten werden per MQTT entfernt). Sind Gas und Wasserpumpe aus, wird Bluetooth gar nicht gestartet.
+
+## Wasserpumpe CaraWater (optional)
+
+Die Pumpe wird – anders als der Gassensor – **aktiv verbunden**: Sie schickt ihren Status als Bluetooth-Notification, Schaltbefehle werden zurückgeschrieben. Das Protokoll stammt aus der Home-Assistant-Integration `carawater_isp15`; die Firmware ersetzt sie bzw. den Bluetooth-Proxy dafür.
+
+**Modelle:** Getestet ist das Protokoll der **ISP 15**. Andere CaraWater-Pumpen, die dieselbe App nutzen (z. B. ISP 20), funktionieren wahrscheinlich ebenso, sind aber ungetestet. Die Pumpe meldet ihr Modell nicht; im Tab Pumpe lässt es sich optional eintragen (nur Anzeige in Home Assistant). Prüfen, ob es passt: Die Pumpe erscheint in der Geräteliste mit **PUMPE**, nach dem Verbinden kommen Werte, und Druck und Durchfluss stimmen mit der App überein.
+
+**Einrichten**
+
+1. Tab **Pumpe**: Schalter oben einschalten (Neustart). In `config.h` ist die Werkseinstellung `PUMP_ENABLED 0`.
+2. Pumpe aus der Liste „Bluetooth-Geräte in der Nähe“ übernehmen (Geräte mit dem Pumpen-Dienst `FF00` sind mit **PUMPE** markiert), optional das Modell eintragen und speichern.
+3. Der ESP verbindet sich, die Werte erscheinen im Tab Pumpe, auf der Live-Seite und in Home Assistant.
+
+**Funktionen** (Web-UI und Home Assistant)
+
+| Entität | Art |
+| --- | --- |
+| Spannung, Strom, Wassertemperatur, Wasserdruck, Durchfluss | Sensor |
+| Tagesverbrauch, Gesamtverbrauch | Sensor (Liter) |
+| Pumpe läuft, Verbindung | Binärsensor |
+| Pumpenfreigabe, Leckage-Erkennung | Schalter |
+| Konstantdruck (Stufe 1–3) | Auswahl |
+| Bluetooth für App freigeben | Schalter |
+
+**Wichtig**
+
+- Die Pumpe erlaubt nur **eine** Bluetooth-Verbindung. Die HA-Integration `carawater_isp15` muss deaktiviert bzw. entfernt werden, sonst streiten sich ESP und Bluetooth-Proxy um die Pumpe.
+- Für die CaraWater-App „Bluetooth für App freigeben“ einschalten: Der ESP trennt sich, die App kann verbinden. Nach 30 Minuten (`PUMP_RELEASE_MS`) oder nach einem Neustart verbindet sich der ESP wieder.
+- Ist die Pumpe nicht erreichbar, versucht der ESP es alle 10 s, bei längerer Abwesenheit seltener (bis 60 s). Der Verbindungsaufbau läuft im Hintergrund, Live-Werte, Web-UI und MQTT laufen währenddessen weiter.
+- Während eines Verbindungsaufbaus pausiert der Bluetooth-Scan kurz, Gaswerte gehen dadurch nicht verloren (der Sensor sendet laufend).
+- Mit eingeschalteter Pumpe läuft der Bluetooth-Scan auch dann, wenn Gas aus ist (für die Geräteliste).
 
 ## Anderer Gassensor
 
@@ -274,6 +324,7 @@ Die laufende Version steht in der Web-UI im Tab **WiFi** und in Home Assistant i
 
 | Version | Änderungen |
 | --- | --- |
+| 1.3.0 | Optionale CaraWater-Wasserpumpe (ISP 15, Modell einstellbar) über BLE: Messwerte, Pumpenfreigabe, Leckage-Erkennung, Konstantdruck, Bluetooth-Freigabe für die App; eigenes HA-Gerät |
 | 1.2.2 | ESP32-S3-Unterstützung (Pins automatisch), Sendeleistung und „AP nur als Notfall“ im Tab WiFi, Neustartgrund, Laufzeit und WLAN-Abbruchgrund in der Web-UI |
 | 1.2.1 | Web-UI gzip-komprimiert (Quelle jetzt in `web/`), kompakte Tab-Leiste (Symbol über Text, passt bis 320 px) |
 | 1.2.0 | Optionaler Grauwasser-Sensor an GPIO1: Votronic Tankelektrode oder Tank-Sensor FL (mit Leer/Voll-Einlernen), eigene Tankgröße, Matrix und Filter |

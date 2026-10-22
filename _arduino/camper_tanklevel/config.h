@@ -6,7 +6,7 @@
 // ============================================================
 // GENERAL CONSTANTS
 // ============================================================
-#define FW_VERSION            "1.2.2"
+#define FW_VERSION            "1.3.0"
 
 #define DEFAULT_AP_SSID       "Camper-Tanklevel" // Base name; "-XXXXXX" (last 3 MAC bytes) is appended
 #define DEFAULT_AP_PASSWORD   "tanklevel1234"    // Test placeholder (min. 8 characters) - change in the web UI
@@ -40,6 +40,7 @@
 #define WATER_ENABLED         1      // Fresh water level (Votronic tank sender)
 #define GREY_ENABLED          0      // Grey water level (second Votronic tank sender) - optional
 #define GAS_ENABLED           1      // Gas level (BLE sensor)
+#define PUMP_ENABLED          0      // CaraWater water pump, e.g. ISP 15 (BLE connection) - optional
 
 #define CONFIG_FILE           "/config.json"
 #define OTA_HOSTNAME          "camper-tanklevel"
@@ -160,6 +161,30 @@
 #define DATA_TIMEOUT_MS       (30UL * 60UL * 1000UL)
 
 // ============================================================
+// WATER PUMP (optional): CaraWater pump via Bluetooth LE connection
+// ------------------------------------------------------------
+// Protocol taken from the CaraWater ISP 15. Other CaraWater pumps using the
+// same app (e.g. ISP 20) probably work too, but are untested. The pump does
+// not report its model, so it can be entered in the web UI (shown in HA only).
+// Unlike the gas sensor, the pump needs an active GATT connection:
+// status frames arrive as notifications, commands are written back.
+// The pump accepts only ONE connection at a time - while the ESP is
+// connected, the CaraWater app (or another HA integration) cannot connect.
+// Use "release Bluetooth for the app" (web UI / Home Assistant) for that.
+// ============================================================
+#define PUMP_SERVICE_UUID     "0000ff00-0000-1000-8000-00805f9b34fb"
+#define PUMP_NOTIFY_UUID      "0000ff01-0000-1000-8000-00805f9b34fb"
+#define PUMP_WRITE_UUID       "0000ff02-0000-1000-8000-00805f9b34fb"
+
+#define PUMP_OFFLINE_MS       10000  // No status frame for 10 s = pump offline
+#define PUMP_RETRY_MS         10000  // Wait between connection attempts
+#define PUMP_RETRY_MAX_MS     60000  // Back-off limit while the pump is out of range
+#define PUMP_CONNECT_TIMEOUT  4000   // Connection attempt timeout in ms (non-blocking)
+#define PUMP_RELEASE_MS       (30UL * 60UL * 1000UL) // App release ends automatically after 30 min (0 = never)
+#define MQTT_PUMP_MS          10000  // Pump: periodic publish (also published on changes)
+#define DEFAULT_PUMP_MODEL    ""     // Model label for Home Assistant, e.g. "ISP 15" (web UI)
+
+// ============================================================
 // TYPES
 // ============================================================
 struct CalibPoint {
@@ -206,6 +231,7 @@ struct AppConfig {
     bool water_enabled;
     bool grey_enabled;
     bool gas_enabled;
+    bool pump_enabled;
 
     // Water tanks
     TankConfig fresh;
@@ -217,6 +243,10 @@ struct AppConfig {
     float capacity;        // Gross bottle capacity in liters
     bool fill_stop_on;     // Bottle has a mechanical fill stop
     float fill_stop;       // Fill stop in %
+
+    // Water pump
+    char pump_mac[18];     // "AA:BB:CC:DD:EE:FF" (upper case), empty = no pump
+    char pump_model[24];   // Model label for Home Assistant only (empty = "Pumpe")
 };
 
 // ============================================================
@@ -244,10 +274,36 @@ struct GasData {
     bool scanning;         // BLE scan is running
 };
 
+struct PumpData {
+    bool connected;        // GATT connection established
+    bool available;        // Connected and a valid status frame within PUMP_OFFLINE_MS
+    bool released;         // Bluetooth released for the app (ESP stays disconnected)
+    bool has_data;         // At least one valid status frame since boot
+    uint8_t status_raw;    // Status byte (bit 0 = pump enabled, bit 2 = leak detection, bits 5-6 = pressure level)
+    uint8_t pressure_level;// Constant pressure level 1-3
+    bool pump_enabled;
+    bool leak_detection;
+    bool running;          // Current > 0.2 A or flow > 0
+    float voltage;         // V
+    float current;         // A
+    float temperature;     // Water temperature in degC
+    float pressure;        // bar
+    uint16_t pressure_raw;
+    float flow;            // l/min
+    uint16_t daily_liters;
+    uint16_t total_liters;
+    int ble_rssi;
+    uint16_t mtu;
+    unsigned long last_update;   // millis() of the last valid frame
+    uint32_t updates;      // Counter of state changes (used to detect new data)
+    char state[24];        // Human readable state for the web UI / MQTT
+};
+
 struct SensorData {
     WaterData water;       // Fresh water
     WaterData grey;        // Grey water
     GasData gas;
+    PumpData pump;
     int rssi;              // WiFi signal strength (written by wifi_manager)
     uint32_t wifi_drops;   // WiFi disconnects since boot
     char wifi_reason[32];  // Reason of the last WiFi disconnect
