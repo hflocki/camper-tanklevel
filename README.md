@@ -1,3 +1,6 @@
+   > **Umgezogen:** Dieses Projekt wird in [hflocki/camper-mqtt](https://github.com/hflocki/camper-mqtt) weitergeführt (Ordner `firmware/<gerät>`).
+   > Bleibt noch aktiv wegen test branch zur pumpe
+
 # Camper Tanklevel – Frischwasser, Grauwasser + Gas auf einem ESP32
 
 Eine Firmware für **einen** ESP32-C3 (oder klassischen ESP32), die zwei Projekte zusammenfasst und um Grauwasser erweitert:
